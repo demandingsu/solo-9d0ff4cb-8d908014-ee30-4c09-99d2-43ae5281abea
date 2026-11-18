@@ -4,6 +4,11 @@
 系统按台站与 UTC 整 10 秒窗(1000 样点)汇总缺口,样点齐全后发布完整
 波形(含每个样点的来源轮次),供震相拾取程序通过接口读取。
 
+内置**同址校时比对**:台网校时员选择参照站、待核站与同一 UTC 整 10 秒窗,
+系统仅用双方已发布的现役波形,把待核站波形在 ±500 ms 内按 10 ms 步进滑动,
+以重叠样点的去均值归一化相关系数寻峰,给出待核站相对参照站的早晚方向、
+时差、相关系数与两窗版本,辅助判断是否安排时钟校验。
+
 技术栈:FastAPI + SQLite + 单页网页(无构建步骤)。
 
 ## 快速启动
@@ -66,8 +71,37 @@ STA1,1769040001000,2,3,-3 0 4 ...
 | GET  | `/api/windows/{station}/{window_start_ms}` | 窗口详情:缺口区间、当前有效样点与来源轮次 |
 | POST | `/api/publish` | 发布窗口,JSON `{station, window_start_ms}`;样点不足 1000 返回 409 且旧窗不变 |
 | GET  | `/api/picking/{station}/{window_start_ms}` | 拾取接口:仅现役窗可读(含 `samples` 与逐样点 `rounds`);过期窗返回 409,未发布返回 404 |
+| GET  | `/api/compare?ref=&check=&window_start_ms=` | 同址校时比对:仅用双方现役窗,滑动待核站波形求相关峰,返回方向/时差/相关系数/两窗版本 |
 
 `from_ms`/`to_ms` 与 CSV 起点一样支持 epoch 毫秒或 ISO-8601。
+
+## 同址校时比对
+
+`GET /api/compare?ref=参照站&check=待核站&window_start_ms=窗起点`(窗起点支持
+epoch 毫秒或 ISO-8601,须按 UTC 整 10 秒对齐;两站不能相同)。
+
+- **数据来源**:只取双方已发布且现役(`active`)的窗;未发布的有效样点不参与。
+- **寻峰**:待核站波形在 ±500 ms 内按 10 ms(1 样点)步进滑动,共 101 个偏移;
+  每个偏移用重叠样点计算去均值归一化相关系数,取峰值。
+- **结果字段**(`decidable=true` 时):
+  - `direction`:`早` / `晚` / `同步` —— 待核站脉冲相对参照站的早晚方向;
+  - `offset_ms`:有符号时差,**正值 = 待核站偏早,负值 = 偏晚**;
+  - `correlation`:峰值相关系数;`ref_version` / `check_version`:两窗版本;
+  - `correlations`:全部 101 个偏移的相关系数(供网页绘制曲线)。
+- **无法判定**(`decidable=false`,`reason_code` 标明原因):
+  - `ref_unpublished` / `check_unpublished`:任一侧窗口未发布;
+  - `ref_stale` / `check_stale`:任一侧窗口已过期(补传后未重新发布);
+  - `ref_constant` / `check_constant`:任一侧波形为常值;
+  - `peak_tie`:多个偏移并列为最高峰(响应附 `tied_shifts_ms`);
+  - `low_correlation`:最高相关系数低于 0.8(响应附实际峰值)。
+- **一致性**:两窗的状态、版本与样点在同一个 SQLite 读事务(同一快照)中取出;
+  补传或重新发布与比对交错时,结论只会来自某个已提交状态,不会把过期或
+  已换版的波形报告为现行结论。过期期间的比对一律返回 `*_stale` 无法判定,
+  重新发布后结论自动反映新版本。
+
+```bash
+curl -s "http://localhost:8000/api/compare?ref=STA1&check=STA2&window_start_ms=1700000000000"
+```
 
 ## curl 示例
 
@@ -94,10 +128,12 @@ curl -s http://localhost:8000/api/picking/STA1/1700000000000
 
 ```
 app/
-  core.py            # 解析、冲突校验、有效样点合成、上传/发布事务
+  core.py            # 解析、冲突校验、有效样点合成、上传/发布事务、校时比对
   db.py              # SQLite 单连接 + 锁,建表
   main.py            # FastAPI 路由与网页挂载
-  static/index.html  # 操作网页(上传/缺口浏览/发布/拾取视图)
+  static/index.html  # 操作网页(上传/缺口浏览/发布/拾取视图/校时比对)
 tests/test_waveform.py  # 21 条自测:重叠、补传、幂等、原子性、交错一致性
+tests/test_compare.py  # 14 条自测:方向/时差、未发布、过期、常值、并列峰、
+                       # 低相关、换版、比对与补传/换版交错的快照一致性
 Dockerfile  docker-compose.yml  requirements*.txt
 ```

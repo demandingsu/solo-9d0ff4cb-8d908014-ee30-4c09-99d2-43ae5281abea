@@ -84,6 +84,28 @@
   <pre id="detail">点击上表"详情"或"拾取读取"查看。</pre>
 </section>
 
+<section>
+  <h2>4. 同址校时比对(校准脉冲)</h2>
+  <div class="row">
+    <label>参照站 <select id="ref-station"></select></label>
+    <label>待核站 <select id="chk-station"></select></label>
+    <label>窗口起点(UTC,整 10 秒) <input type="datetime-local" id="cmp-window" step="10"></label>
+    <button id="btn-compare">比对</button>
+  </div>
+  <div class="muted" style="margin-bottom:6px">
+    仅使用双方已发布的现役波形;待核站波形在 ±500 ms 内按 10 ms 步进滑动,
+    以重叠样点的去均值归一化相关系数寻峰。任一侧未发布 / 过期 / 常值、
+    峰值并列或最高相关系数低于 0.8 时返回"无法判定"。
+  </div>
+  <div id="cmp-summary" class="muted" style="margin-bottom:6px">选择台站与窗口后点击"比对"。</div>
+  <canvas id="cmp-plot" width="1040" height="180"
+          style="width:100%;display:none;background:#fff;border:1px solid #d0d7de;border-radius:6px"></canvas>
+  <div class="muted" id="cmp-plot-cap" style="display:none">
+    横轴:待核站波形偏移(ms),正值 = 待核站偏早;纵轴:去均值归一化相关系数;红虚线 = 阈值 0.8;红点 = 峰值。
+  </div>
+  <pre id="cmp-result" style="display:none"></pre>
+</section>
+
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -92,6 +114,10 @@ const pad = n => String(n).padStart(2, '0');
 function msToInput(ms) {
   const d = new Date(ms);
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+function msToInputSec(ms) {  // 整 10 秒对齐,带秒
+  const d = new Date(ms - (ms % 10000));
+  return `${msToInput(ms)}:${pad(d.getUTCSeconds())}`;
 }
 function inputToMs(v) {
   if (!v) return null;
@@ -140,15 +166,22 @@ $('btn-upload').addEventListener('click', async () => {
 // ---------- 台站与窗口 ----------
 async function refreshStations() {
   const { body } = await api('/api/stations');
-  const sel = $('station');
-  const cur = sel.value;
-  sel.innerHTML = '';
-  for (const s of (body.stations || [])) {
-    const o = document.createElement('option');
-    o.value = o.textContent = s;
-    sel.appendChild(o);
+  const stations = body.stations || [];
+  for (const id of ['station', 'ref-station', 'chk-station']) {
+    const sel = $(id);
+    const cur = sel.value;
+    sel.innerHTML = '';
+    for (const s of stations) {
+      const o = document.createElement('option');
+      o.value = o.textContent = s;
+      sel.appendChild(o);
+    }
+    if (cur) sel.value = cur;
   }
-  if (cur) sel.value = cur;
+  // 待核站默认取一个与参照站不同的台站
+  const ref = $('ref-station'), chk = $('chk-station');
+  if (ref.value === chk.value && stations.length > 1)
+    chk.value = stations.find(s => s !== ref.value);
 }
 
 async function loadWindows() {
@@ -216,11 +249,106 @@ async function showPicking(st, wstart) {
 
 $('btn-load').addEventListener('click', loadWindows);
 
+// ---------- 同址校时比对 ----------
+function summarizeCmp(d) {  // 相关曲线在 pre 中截断显示
+  const c = {...d};
+  if (Array.isArray(c.correlations))
+    c.correlations = `... 共${d.correlations.length}个偏移点,见上图`;
+  return c;
+}
+
+function renderCompareSummary(r) {
+  const el = $('cmp-summary');
+  const ver = `参照站 v${r.ref_version ?? '—'} / 待核站 v${r.check_version ?? '—'}`;
+  if (!r.decidable) {
+    el.textContent = `无法判定:${r.reason}(${ver})`;
+    el.className = 'err';
+    return;
+  }
+  const dir = r.direction === '同步' ? '两站同步,时差 0 ms'
+            : `待核站脉冲比参照站偏${r.direction} ${Math.abs(r.offset_ms)} ms`;
+  const advice = r.offset_ms === 0 ? '无需安排时钟校验。' : '建议安排时钟校验。';
+  el.textContent = `结论:${dir};相关系数 ${r.correlation.toFixed(4)};${ver}。${advice}`;
+  el.className = 'ok';
+}
+
+function plotCorrelations(corrs, bestShiftMs) {
+  const cv = $('cmp-plot');
+  cv.style.display = 'block';
+  $('cmp-plot-cap').style.display = 'block';
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height, L = 46, R = 12, T = 12, B = 24;
+  ctx.clearRect(0, 0, W, H);
+  const X = ms => L + (ms + 500) / 1000 * (W - L - R);
+  const Y = c => T + (1 - (c + 1) / 2) * (H - T - B);
+  ctx.font = '11px sans-serif';
+  ctx.strokeStyle = '#eaeef2'; ctx.fillStyle = '#6e7781'; ctx.lineWidth = 1;
+  for (const c of [-1, -0.5, 0, 0.5, 1]) {
+    ctx.beginPath(); ctx.moveTo(L, Y(c)); ctx.lineTo(W - R, Y(c)); ctx.stroke();
+    ctx.fillText(c.toFixed(1), 10, Y(c) + 4);
+  }
+  for (const ms of [-500, -250, 0, 250, 500])
+    ctx.fillText(String(ms), X(ms) - 10, H - 8);
+  // 阈值线 0.8
+  ctx.strokeStyle = '#cf222e'; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(L, Y(0.8)); ctx.lineTo(W - R, Y(0.8)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#cf222e'; ctx.fillText('阈值 0.8', W - 64, Y(0.8) - 5);
+  // 相关曲线(跳过无定义偏移)
+  ctx.strokeStyle = '#0969da'; ctx.lineWidth = 1.5; ctx.beginPath();
+  let started = false;
+  for (const p of corrs) {
+    if (p.corr == null) { started = false; continue; }
+    const px = X(p.shift_ms), py = Y(p.corr);
+    if (started) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    started = true;
+  }
+  ctx.stroke();
+  // 峰值点
+  if (bestShiftMs != null) {
+    const best = corrs.find(p => p.shift_ms === bestShiftMs);
+    if (best && best.corr != null) {
+      ctx.fillStyle = '#cf222e';
+      ctx.beginPath(); ctx.arc(X(bestShiftMs), Y(best.corr), 4, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+}
+
+$('btn-compare').addEventListener('click', async () => {
+  const ref = $('ref-station').value, chk = $('chk-station').value;
+  const w = inputToMs($('cmp-window').value);
+  const sum = $('cmp-summary');
+  if (!ref || !chk || w == null) {
+    sum.textContent = '请选择参照站、待核站并填写整 10 秒的窗口起点';
+    sum.className = 'err';
+    return;
+  }
+  sum.textContent = '比对中...'; sum.className = '';
+  const q = `/api/compare?ref=${encodeURIComponent(ref)}&check=${encodeURIComponent(chk)}&window_start_ms=${w}`;
+  const { status, body } = await api(q);
+  showJson($('cmp-result'), body ? summarizeCmp(body) : {});
+  if (status !== 200) {
+    sum.textContent = `请求失败(${status}):${body && body.detail || ''}`;
+    sum.className = 'err';
+    $('cmp-plot').style.display = 'none';
+    $('cmp-plot-cap').style.display = 'none';
+    return;
+  }
+  renderCompareSummary(body);
+  if (body.correlations)
+    plotCorrelations(body.correlations, body.decidable ? body.offset_ms : body.best_shift_ms);
+  else {
+    $('cmp-plot').style.display = 'none';
+    $('cmp-plot-cap').style.display = 'none';
+  }
+});
+
 // ---------- 初始化 ----------
 (function init() {
   const now = Date.now();
   $('from').value = msToInput(now - 30 * 60 * 1000);
   $('to').value = msToInput(now + 30 * 60 * 1000);
+  $('cmp-window').value = msToInputSec(now - 60 * 1000);
   refreshStations().then(loadWindows);
 })();
 </script>

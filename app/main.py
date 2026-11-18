@@ -92,6 +92,14 @@ def create_app(db_path: str) -> FastAPI:
             raise HTTPException(409, "窗口已过期(补传改变了有效样点),需重新发布")
         return res
 
+    @app.get("/api/compare")
+    def compare(ref: str, check: str, window_start_ms: str):
+        """同址校时比对:参照站 ref 与待核站 check 的同一 UTC 整 10 秒窗,
+        仅用双方现役波形,滑动待核站波形求去均值归一化相关峰。
+        window_start_ms 支持 epoch 毫秒或 ISO-8601。"""
+        wstart = core.parse_time_ms(window_start_ms)
+        return core.compare_windows(db, ref, check, wstart)
+
     return app
 
 

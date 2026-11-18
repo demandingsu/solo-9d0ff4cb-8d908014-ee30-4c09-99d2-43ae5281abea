@@ -9,12 +9,15 @@
 - 上传在单个 BEGIN IMMEDIATE 事务中完成,任何失败整体回滚,
   不改变原有片段与窗状态;入库后重算受影响的现役窗,有效样点变化即标 stale。
 - 发布需窗内 1000 个有效样点齐全,成功才替换现役窗;失败回滚,保留旧窗状态。
+- 同址校时比对:仅用双方现役窗,待核站波形在 ±500 ms 内按 10 ms 滑动,
+  以重叠样点的去均值归一化相关系数寻峰;两窗数据与状态取自同一读事务快照。
 """
 from __future__ import annotations
 
 import datetime as _dt
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 
@@ -23,6 +26,10 @@ WINDOW_MS = 10_000                          # 10 s
 WINDOW_SAMPLES = WINDOW_MS // SAMPLE_MS     # 1000
 MAX_SAMPLES_PER_SEGMENT = 200_000
 MAX_WINDOWS_PER_QUERY = 720
+MAX_SHIFT_MS = 500                              # 校时比对:待核站波形滑动范围 ±500 ms
+MAX_SHIFT_SAMPLES = MAX_SHIFT_MS // SAMPLE_MS   # 50 个样点
+CORR_THRESHOLD = 0.8                            # 可判定的最低相关系数
+TIE_TOL = 1e-9                                  # 峰值并列判定容差(绝对)
 _INT32_MIN = -(2 ** 31)
 _INT32_MAX = 2 ** 31 - 1
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
@@ -422,3 +429,143 @@ def window_detail(db, station: str, window_start_ms: int) -> dict:
                 "version": row["version"] if row else 0,
                 "published_at": row["published_at"] if row else None,
                 "samples": values, "rounds": rounds}
+
+
+# ---------------------------------------------------------------- 同址校时比对
+
+def _mean_removed_corr(x: list, y: list):
+    """去均值归一化相关系数;任一侧重叠段零方差时返回 None(该偏移不参与寻峰)。"""
+    n = len(x)
+    mx = sum(x) / n
+    my = sum(y) / n
+    sxy = sxx = syy = 0.0
+    for a, b in zip(x, y):
+        da = a - mx
+        db = b - my
+        sxy += da * db
+        sxx += da * da
+        syy += db * db
+    if sxx == 0.0 or syy == 0.0:
+        return None
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _slide_correlations(ref: list, chk: list) -> list:
+    """待核站波形在 ±500 ms 内按 10 ms 步进滑动,逐偏移算去均值归一化相关系数。
+
+    shift_ms > 0 表示把待核站波形向晚移该时长后与参照站对齐,
+    即待核站脉冲原本偏早;shift_ms < 0 则待核站偏晚。
+    """
+    n = len(ref)
+    out = []
+    for k in range(-MAX_SHIFT_SAMPLES, MAX_SHIFT_SAMPLES + 1):
+        lo = max(0, k)
+        hi = min(n, n + k)
+        corr = _mean_removed_corr(ref[lo:hi], chk[lo - k:hi - k])
+        out.append({"shift_ms": k * SAMPLE_MS, "corr": corr})
+    return out
+
+
+def compare_windows(db, ref_station: str, check_station: str,
+                    window_start_ms: int) -> dict:
+    """同址两台站同一 UTC 整 10 秒窗的校准脉冲比对。
+
+    仅使用双方已发布的现役(active)窗;两窗的状态、版本与样点在同一个
+    SQLite 读事务(同一快照)中取出,交错的补传/换版不会把过期或已换版
+    的波形混入本次结论。任一侧未发布、过期、常值、峰值并列或最高相关
+    系数低于 0.8 时 decidable=False(无法判定)。
+    """
+    if window_start_ms % WINDOW_MS != 0:
+        raise BatchRejected("窗口起点须按 UTC 整 10 秒对齐")
+    if ref_station == check_station:
+        raise BatchRejected("参照站与待核站不能是同一台站")
+
+    with db.lock:
+        conn = db.conn
+        # 显式读事务:两个 SELECT 落在同一快照上,即使多实例/多连接并发,
+        # 两窗数据与状态也来自同一个已提交状态。
+        conn.execute("BEGIN")
+        try:
+            rows = {}
+            for st in (ref_station, check_station):
+                rows[st] = conn.execute(
+                    "SELECT state, samples, version, published_at FROM windows "
+                    "WHERE station=? AND window_start_ms=?",
+                    (st, window_start_ms)).fetchone()
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    ref_row, chk_row = rows[ref_station], rows[check_station]
+
+    result = {
+        "ref_station": ref_station,
+        "check_station": check_station,
+        "window_start_ms": window_start_ms,
+        "start_utc": ms_to_iso(window_start_ms),
+        "ref_version": ref_row["version"] if ref_row else None,
+        "check_version": chk_row["version"] if chk_row else None,
+        "ref_published_at": ref_row["published_at"] if ref_row else None,
+        "check_published_at": chk_row["published_at"] if chk_row else None,
+        "max_shift_ms": MAX_SHIFT_MS,
+        "corr_threshold": CORR_THRESHOLD,
+        "decidable": False,
+        "reason_code": None,
+        "reason": None,
+        "direction": None,       # "早" | "晚" | "同步"(待核站相对参照站)
+        "offset_ms": None,       # 有符号时差:正值=待核站偏早,负值=偏晚
+        "shift_samples": None,
+        "correlation": None,
+        "best_shift_ms": None,
+        "correlations": None,
+    }
+
+    def fail(code: str, reason: str) -> dict:
+        result.update(reason_code=code, reason=reason)
+        return result
+
+    if ref_row is None:
+        return fail("ref_unpublished", f"参照站 {ref_station} 该窗尚未发布")
+    if chk_row is None:
+        return fail("check_unpublished", f"待核站 {check_station} 该窗尚未发布")
+    if ref_row["state"] != "active":
+        return fail("ref_stale",
+                    f"参照站 {ref_station} 窗口已过期(补传改变了有效样点,需重新发布)")
+    if chk_row["state"] != "active":
+        return fail("check_stale",
+                    f"待核站 {check_station} 窗口已过期(补传改变了有效样点,需重新发布)")
+
+    ref = json.loads(ref_row["samples"])
+    chk = json.loads(chk_row["samples"])
+    if min(ref) == max(ref):
+        return fail("ref_constant", f"参照站 {ref_station} 波形为常值,无法比对")
+    if min(chk) == max(chk):
+        return fail("check_constant", f"待核站 {check_station} 波形为常值,无法比对")
+
+    corrs = _slide_correlations(ref, chk)
+    result["correlations"] = corrs
+    defined = [(c["shift_ms"], c["corr"]) for c in corrs if c["corr"] is not None]
+    if not defined:
+        return fail("no_valid_overlap", "所有偏移下重叠段均无方差,无法计算相关系数")
+
+    best_corr = max(c for _, c in defined)
+    peak_shifts = [s for s, c in defined if c >= best_corr - TIE_TOL]
+    result["correlation"] = best_corr
+    result["best_shift_ms"] = peak_shifts[0]
+    if len(peak_shifts) > 1:
+        result["tied_shifts_ms"] = peak_shifts
+        return fail("peak_tie",
+                    f"相关峰并列:偏移 {peak_shifts} ms 处相关系数同为 "
+                    f"{best_corr:.6f},无法唯一确定时差")
+    if best_corr < CORR_THRESHOLD:
+        return fail("low_correlation",
+                    f"最高相关系数 {best_corr:.4f} 低于阈值 {CORR_THRESHOLD}")
+
+    shift_ms = peak_shifts[0]
+    result.update(
+        decidable=True,
+        shift_samples=shift_ms // SAMPLE_MS,
+        offset_ms=shift_ms,
+        direction="同步" if shift_ms == 0 else ("早" if shift_ms > 0 else "晚"),
+    )
+    return result
